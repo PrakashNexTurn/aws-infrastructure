@@ -467,7 +467,7 @@ jobs:
           fi
 
       - name: Terraform Apply
-        if: github.event.inputs.action == 'apply' && steps.plan.outputs.plan_exitcode == '2'
+        if: github.event.inputs.action == 'apply' && (steps.plan.outputs.plan_exitcode == '2' || steps.plan.outputs.plan_exitcode == '0')
         run: |
           cd "terraform/${{ needs.validate-inputs.outputs.environment }}"
           echo "🚀 Applying Terraform changes..."
@@ -494,7 +494,7 @@ jobs:
           echo "✅ Infrastructure destruction completed"
 
       - name: Upload Terraform Plan
-        if: github.event.inputs.action == 'plan' && steps.plan.outputs.plan_exitcode == '2'
+        if: github.event.inputs.action == 'plan' && (steps.plan.outputs.plan_exitcode == '2' || steps.plan.outputs.plan_exitcode == '0')
         uses: actions/upload-artifact@v4
         with:
           name: terraform-plan-${{ needs.validate-inputs.outputs.environment }}
