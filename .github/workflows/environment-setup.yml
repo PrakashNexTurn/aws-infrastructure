@@ -253,13 +253,36 @@ jobs:
             }
           }
           
+          # Filter out us-east-1e if in us-east-1 region (EKS limitation)
+          locals {
+            filtered_subnets = ${{ needs.validate-inputs.outputs.aws_region == 'us-east-1' && '[for s in data.aws_subnets.default.ids : s if !endswith(data.aws_subnet.all[s].availability_zone, "e")]' || 'data.aws_subnets.default.ids' }}
+          }
+          EOF
+          
+          # Add subnet data sources if us-east-1 region
+          if [[ "${{ needs.validate-inputs.outputs.aws_region }}" == "us-east-1" ]]; then
+            cat >> main.tf << 'EOF'
+          
+          # Get all subnet details for filtering
+          data "aws_subnet" "all" {
+            for_each = toset(data.aws_subnets.default.ids)
+            id       = each.value
+          }
+          EOF
+          fi
+          
+          cat >> main.tf << 'EOF'
+          
           # EKS Cluster Module
           module "eks_cluster" {
             source = "git::https://github.com/PrakashNexTurn/terraform-scripts.git//modules/eks?ref=develop"
           
             cluster_name    = "nextops-${{ needs.validate-inputs.outputs.environment }}-eks"
             vpc_id          = data.aws_vpc.default.id
-            subnet_ids      = data.aws_subnets.default.ids
+            subnet_ids      = local.filtered_subnets
+          
+            # CRITICAL FIX: Pass node group subnet IDs explicitly
+            node_group_subnet_ids = local.filtered_subnets
           
             # Node group configuration
             node_group_desired_size = ${{ needs.validate-inputs.outputs.environment == 'prod' && '3' || '2' }}
@@ -353,6 +376,17 @@ jobs:
             description = "Status of the EKS Node Group"
             value       = module.eks_cluster.node_group_status
           }
+          
+          # Subnet information
+          output "vpc_id" {
+            description = "ID of the VPC used"
+            value       = data.aws_vpc.default.id
+          }
+          
+          output "subnet_ids" {
+            description = "List of subnet IDs used"
+            value       = local.filtered_subnets
+          }
           EOF
           
           # Add ECR outputs
@@ -371,6 +405,12 @@ jobs:
             description = "The ARN of the $service ECR repository"
             value       = module.ecr_${service_var}.repository_arn
           }
+          
+          # Repository information for CI/CD (fixed deprecation)
+          output "ecr_${service_var}_repository_info" {
+            description = "Complete repository information for $service"
+            value       = module.ecr_${service_var}.repository_info
+          }
           EOF
           done
           
@@ -380,8 +420,8 @@ jobs:
           echo "📁 Generated files:"
           ls -la
           echo ""
-          echo "📄 main.tf contents:"
-          cat main.tf
+          echo "📄 main.tf contents (first 100 lines):"
+          head -100 main.tf
           echo ""
           echo "📄 outputs.tf contents:"
           cat outputs.tf
@@ -494,6 +534,7 @@ jobs:
           echo "- **Node Group**: Managed node group with auto-scaling" >> $GITHUB_STEP_SUMMARY
           echo "- **Encryption**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
           echo "- **Logging**: ✅ Comprehensive control plane logs" >> $GITHUB_STEP_SUMMARY
+          echo "- **Subnets**: ✅ Properly configured (us-east-1e excluded if needed)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           echo "### ECR Repositories" >> $GITHUB_STEP_SUMMARY
@@ -512,6 +553,12 @@ jobs:
           echo "- **DynamoDB Table**: \`${{ needs.validate-inputs.outputs.state_table }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **State Encryption**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
           echo "- **State Locking**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 🔧 Bug Fixes Applied" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ **EKS Node Group Subnets**: Fixed missing \`node_group_subnet_ids\` parameter" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ **ECR Deprecation**: Using \`repository_info\` output instead of deprecated fields" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ **us-east-1e Exclusion**: Filtered out unsupported availability zone for EKS" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Add status based on job results
