@@ -1,0 +1,581 @@
+name: Environment Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment name (dev, staging, prod)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      ecr_services:
+        description: 'Comma-separated list of service names for ECR repositories'
+        required: true
+        type: string
+        default: 'frontend,backend,api'
+      action:
+        description: 'Terraform action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: plan
+      aws_region:
+        description: 'AWS region for deployment'
+        required: false
+        type: choice
+        options:
+          - us-east-1
+          - us-west-1
+          - us-west-2
+          - eu-west-1
+          - ap-southeast-1
+        default: us-west-2
+
+env:
+  TF_VERSION: '1.12.1'
+  AWS_DEFAULT_REGION: ${{ github.event.inputs.aws_region || 'us-west-2' }}
+  TF_IN_AUTOMATION: true
+  TF_CLI_ARGS: "-no-color"
+
+jobs:
+  validate-inputs:
+    name: Validate Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.validate.outputs.environment }}
+      ecr_services: ${{ steps.validate.outputs.ecr_services }}
+      aws_region: ${{ steps.validate.outputs.aws_region }}
+      state_bucket: ${{ steps.validate.outputs.state_bucket }}
+      state_table: ${{ steps.validate.outputs.state_table }}
+      
+    steps:
+      - name: Validate and Process Inputs
+        id: validate
+        run: |
+          # Validate environment
+          if [[ ! "${{ github.event.inputs.environment }}" =~ ^(dev|staging|prod)$ ]]; then
+            echo "❌ Invalid environment. Must be dev, staging, or prod"
+            exit 1
+          fi
+          
+          # Validate AWS region doesn't use us-east-1e (not supported by EKS)
+          if [[ "${{ env.AWS_DEFAULT_REGION }}" == "us-east-1" ]]; then
+            echo "⚠️  Warning: us-east-1e availability zone not supported by EKS"
+          fi
+          
+          # Process ECR services list
+          ecr_services="${{ github.event.inputs.ecr_services }}"
+          if [[ -z "$ecr_services" ]]; then
+            echo "❌ ECR services list cannot be empty"
+            exit 1
+          fi
+          
+          # Validate service names (lowercase, alphanumeric, hyphens, underscores only)
+          IFS=',' read -ra services <<< "$ecr_services"
+          for service in "${services[@]}"; do
+            service=$(echo "$service" | xargs) # trim whitespace
+            if [[ ! "$service" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+              echo "❌ Invalid service name: $service. Must be lowercase alphanumeric with hyphens, underscores, and periods only"
+              exit 1
+            fi
+          done
+          
+          # Set outputs
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          echo "ecr_services=$ecr_services" >> $GITHUB_OUTPUT
+          echo "aws_region=${{ env.AWS_DEFAULT_REGION }}" >> $GITHUB_OUTPUT
+          echo "state_bucket=nextops-terraform-state-${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          echo "state_table=nextops-terraform-state-${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          
+          echo "✅ All inputs validated successfully"
+
+  setup-backend:
+    name: Setup Terraform Backend
+    runs-on: ubuntu-latest
+    needs: validate-inputs
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ needs.validate-inputs.outputs.aws_region }}
+
+      - name: Setup Terraform Backend
+        run: |
+          # Check if S3 bucket exists and create if not
+          if ! aws s3 ls "s3://${{ needs.validate-inputs.outputs.state_bucket }}" 2>/dev/null; then
+            echo "📦 Creating S3 bucket: ${{ needs.validate-inputs.outputs.state_bucket }}"
+            
+            if [[ "${{ needs.validate-inputs.outputs.aws_region }}" == "us-east-1" ]]; then
+              aws s3 mb "s3://${{ needs.validate-inputs.outputs.state_bucket }}"
+            else
+              aws s3 mb "s3://${{ needs.validate-inputs.outputs.state_bucket }}" --region "${{ needs.validate-inputs.outputs.aws_region }}"
+            fi
+            
+            # Enable versioning
+            aws s3api put-bucket-versioning \
+              --bucket "${{ needs.validate-inputs.outputs.state_bucket }}" \
+              --versioning-configuration Status=Enabled
+            
+            # Enable server-side encryption
+            aws s3api put-bucket-encryption \
+              --bucket "${{ needs.validate-inputs.outputs.state_bucket }}" \
+              --server-side-encryption-configuration '{
+                "Rules": [{
+                  "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "AES256"
+                  }
+                }]
+              }'
+            
+            # Block public access
+            aws s3api put-public-access-block \
+              --bucket "${{ needs.validate-inputs.outputs.state_bucket }}" \
+              --public-access-block-configuration \
+                BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          else
+            echo "✅ S3 bucket already exists: ${{ needs.validate-inputs.outputs.state_bucket }}"
+          fi
+          
+          # Check if DynamoDB table exists and create if not
+          if ! aws dynamodb describe-table --table-name "${{ needs.validate-inputs.outputs.state_table }}" 2>/dev/null; then
+            echo "🗄️  Creating DynamoDB table: ${{ needs.validate-inputs.outputs.state_table }}"
+            
+            aws dynamodb create-table \
+              --table-name "${{ needs.validate-inputs.outputs.state_table }}" \
+              --attribute-definitions AttributeName=LockID,AttributeType=S \
+              --key-schema AttributeName=LockID,KeyType=HASH \
+              --provisioned-throughput ReadCapacityUnits=5,WriteCapacityUnits=5 \
+              --tags Key=Environment,Value=${{ needs.validate-inputs.outputs.environment }} \
+                     Key=Purpose,Value=TerraformStateLock \
+                     Key=ManagedBy,Value=GitHubActions
+            
+            # Wait for table to be active
+            aws dynamodb wait table-exists --table-name "${{ needs.validate-inputs.outputs.state_table }}"
+          else
+            echo "✅ DynamoDB table already exists: ${{ needs.validate-inputs.outputs.state_table }}"
+          fi
+
+  terraform-plan-apply:
+    name: Terraform ${{ github.event.inputs.action }}
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, setup-backend]
+    
+    steps:
+      - name: Checkout Infrastructure Repository
+        uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ needs.validate-inputs.outputs.aws_region }}
+
+      - name: Generate Terraform Configuration
+        id: generate-config
+        run: |
+          # Create terraform directory for this environment
+          mkdir -p "terraform/${{ needs.validate-inputs.outputs.environment }}"
+          cd "terraform/${{ needs.validate-inputs.outputs.environment }}"
+          
+          # Process ECR services list
+          ecr_services="${{ needs.validate-inputs.outputs.ecr_services }}"
+          IFS=',' read -ra services_array <<< "$ecr_services"
+          
+          # Generate terraform configuration
+          cat > main.tf << 'EOF'
+          terraform {
+            required_version = ">= 1.0"
+            required_providers {
+              aws = {
+                source  = "hashicorp/aws"
+                version = ">= 5.0"
+              }
+            }
+            
+            backend "s3" {
+              bucket         = "${{ needs.validate-inputs.outputs.state_bucket }}"
+              key            = "terraform.tfstate"
+              region         = "${{ needs.validate-inputs.outputs.aws_region }}"
+              dynamodb_table = "${{ needs.validate-inputs.outputs.state_table }}"
+              encrypt        = true
+            }
+          }
+          
+          provider "aws" {
+            region = "${{ needs.validate-inputs.outputs.aws_region }}"
+            
+            default_tags {
+              tags = {
+                Environment = "${{ needs.validate-inputs.outputs.environment }}"
+                Project     = "nextops"
+                ManagedBy   = "terraform"
+                Repository  = "aws-infrastructure"
+                Workflow    = "environment-setup"
+              }
+            }
+          }
+          
+          # Get default VPC and subnets
+          data "aws_vpc" "default" {
+            default = true
+          }
+          
+          data "aws_subnets" "default" {
+            filter {
+              name   = "vpc-id"
+              values = [data.aws_vpc.default.id]
+            }
+            
+            filter {
+              name   = "availability-zone"
+              values = [
+                "${{ needs.validate-inputs.outputs.aws_region }}a",
+                "${{ needs.validate-inputs.outputs.aws_region }}b",
+                "${{ needs.validate-inputs.outputs.aws_region }}c"
+              ]
+            }
+          }
+          
+          # Filter out us-east-1e if in us-east-1 region (EKS limitation)
+          locals {
+            filtered_subnets = ${{ needs.validate-inputs.outputs.aws_region == 'us-east-1' && '[for s in data.aws_subnets.default.ids : s if !endswith(data.aws_subnet.all[s].availability_zone, "e")]' || 'data.aws_subnets.default.ids' }}
+          }
+          EOF
+          
+          # Add subnet data sources if us-east-1 region
+          if [[ "${{ needs.validate-inputs.outputs.aws_region }}" == "us-east-1" ]]; then
+            cat >> main.tf << 'EOF'
+          
+          # Get all subnet details for filtering
+          data "aws_subnet" "all" {
+            for_each = toset(data.aws_subnets.default.ids)
+            id       = each.value
+          }
+          EOF
+          fi
+          
+          cat >> main.tf << 'EOF'
+          
+          # EKS Cluster Module
+          module "eks_cluster" {
+            source = "git::https://github.com/PrakashNexTurn/terraform-scripts.git//modules/eks?ref=develop"
+          
+            cluster_name    = "nextops-${{ needs.validate-inputs.outputs.environment }}-eks"
+            vpc_id          = data.aws_vpc.default.id
+            subnet_ids      = local.filtered_subnets
+          
+            # CRITICAL FIX: Pass node group subnet IDs explicitly
+            node_group_subnet_ids = local.filtered_subnets
+          
+            # Node group configuration
+            node_group_desired_size = ${{ needs.validate-inputs.outputs.environment == 'prod' && '3' || '2' }}
+            node_group_max_size     = ${{ needs.validate-inputs.outputs.environment == 'prod' && '5' || '3' }}
+            node_group_min_size     = ${{ needs.validate-inputs.outputs.environment == 'prod' && '2' || '1' }}
+          
+            node_group_instance_types = [
+              ${{ needs.validate-inputs.outputs.environment == 'prod' && '"t3.large"' || '"t3.medium"' }}
+            ]
+          
+            # Enable encryption and logging
+            enable_encryption  = true
+            cluster_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+          
+            common_tags = {
+              Environment = "${{ needs.validate-inputs.outputs.environment }}"
+              Project     = "nextops"
+              Component   = "eks"
+            }
+          }
+          EOF
+          
+          # Generate ECR repositories
+          for service in "${services_array[@]}"; do
+            service=$(echo "$service" | xargs) # trim whitespace
+            cat >> main.tf << EOF
+          
+          # ECR Repository for $service
+          module "ecr_${service//-/_}" {
+            source = "git::https://github.com/PrakashNexTurn/terraform-scripts.git//modules/ecr?ref=develop"
+          
+            repository_name = "nextops-${{ needs.validate-inputs.outputs.environment }}-${service}"
+          
+            # Security and compliance
+            scan_on_push           = true
+            enable_kms_encryption  = true
+            force_delete          = ${{ needs.validate-inputs.outputs.environment != 'prod' && 'true' || 'false' }}
+          
+            # Lifecycle management
+            enable_lifecycle_policy           = true
+            max_image_count                  = ${{ needs.validate-inputs.outputs.environment == 'prod' && '20' || '10' }}
+            untagged_image_retention_days    = ${{ needs.validate-inputs.outputs.environment == 'prod' && '14' || '7' }}
+          
+            protected_tags = [
+              "latest", 
+              "main", 
+              "master", 
+              "${{ needs.validate-inputs.outputs.environment }}", 
+              "stable"
+            ]
+          
+            common_tags = {
+              Environment = "${{ needs.validate-inputs.outputs.environment }}"
+              Project     = "nextops"
+              Component   = "ecr"
+              Service     = "${service}"
+            }
+          }
+          EOF
+          done
+          
+          # Generate outputs.tf
+          cat > outputs.tf << 'EOF'
+          # EKS Cluster Outputs
+          output "eks_cluster_id" {
+            description = "The ID of the EKS cluster"
+            value       = module.eks_cluster.cluster_id
+          }
+          
+          output "eks_cluster_arn" {
+            description = "The Amazon Resource Name (ARN) of the cluster"
+            value       = module.eks_cluster.cluster_arn
+          }
+          
+          output "eks_cluster_endpoint" {
+            description = "The endpoint for your EKS Kubernetes API server"
+            value       = module.eks_cluster.cluster_endpoint
+          }
+          
+          output "eks_cluster_version" {
+            description = "The Kubernetes server version for the EKS cluster"
+            value       = module.eks_cluster.cluster_version
+          }
+          
+          output "eks_node_group_arn" {
+            description = "Amazon Resource Name (ARN) of the EKS Node Group"
+            value       = module.eks_cluster.node_group_arn
+          }
+          
+          output "eks_node_group_status" {
+            description = "Status of the EKS Node Group"
+            value       = module.eks_cluster.node_group_status
+          }
+          
+          # Subnet information
+          output "vpc_id" {
+            description = "ID of the VPC used"
+            value       = data.aws_vpc.default.id
+          }
+          
+          output "subnet_ids" {
+            description = "List of subnet IDs used"
+            value       = local.filtered_subnets
+          }
+          EOF
+          
+          # Add ECR outputs
+          for service in "${services_array[@]}"; do
+            service=$(echo "$service" | xargs) # trim whitespace
+            service_var="${service//-/_}"
+            cat >> outputs.tf << EOF
+          
+          # ECR Repository Outputs for $service
+          output "ecr_${service_var}_repository_url" {
+            description = "The URL of the $service ECR repository"
+            value       = module.ecr_${service_var}.repository_url
+          }
+          
+          output "ecr_${service_var}_repository_arn" {
+            description = "The ARN of the $service ECR repository"
+            value       = module.ecr_${service_var}.repository_arn
+          }
+          
+          # Repository information for CI/CD (fixed deprecation)
+          output "ecr_${service_var}_repository_info" {
+            description = "Complete repository information for $service"
+            value       = module.ecr_${service_var}.repository_info
+          }
+          EOF
+          done
+          
+          echo "✅ Terraform configuration generated successfully"
+          
+          # Display generated files for debugging
+          echo "📁 Generated files:"
+          ls -la
+          echo ""
+          echo "📄 main.tf contents (first 100 lines):"
+          head -100 main.tf
+          echo ""
+          echo "📄 outputs.tf contents:"
+          cat outputs.tf
+
+      - name: Terraform Init
+        run: |
+          cd "terraform/${{ needs.validate-inputs.outputs.environment }}"
+          echo "🔧 Initializing Terraform..."
+          terraform init
+
+      - name: Terraform Validate
+        run: |
+          cd "terraform/${{ needs.validate-inputs.outputs.environment }}"
+          echo "✅ Validating Terraform configuration..."
+          terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        if: github.event.inputs.action == 'plan' || github.event.inputs.action == 'apply'
+        run: |
+          cd "terraform/${{ needs.validate-inputs.outputs.environment }}"
+          echo "📋 Running Terraform plan..."
+          
+          # Run terraform plan and capture output
+          terraform plan \
+            -var-file=terraform.tfvars 2>/dev/null || \
+          terraform plan \
+            -out=tfplan \
+            -detailed-exitcode
+          
+          # Capture exit code
+          plan_exitcode=$?
+          echo "plan_exitcode=$plan_exitcode" >> $GITHUB_OUTPUT
+          
+          # Check exit codes (0=no changes, 1=error, 2=changes planned)
+          if [ $plan_exitcode -eq 0 ]; then
+            echo "✅ No changes detected"
+          elif [ $plan_exitcode -eq 2 ]; then
+            echo "📝 Changes planned for infrastructure"
+          else
+            echo "❌ Terraform plan failed with exit code: $plan_exitcode"
+            exit 1
+          fi
+
+      - name: Terraform Apply
+        if: github.event.inputs.action == 'apply' && (steps.plan.outputs.plan_exitcode == '2' || steps.plan.outputs.plan_exitcode == '0')
+        run: |
+          cd "terraform/${{ needs.validate-inputs.outputs.environment }}"
+          echo "🚀 Applying Terraform changes..."
+          terraform apply -auto-approve tfplan
+          
+          echo "✅ Infrastructure deployment completed successfully"
+          
+          # Display important outputs
+          echo "📊 Infrastructure Summary:"
+          terraform output -json | jq -r '
+            to_entries[] | 
+            "\(.key): \(.value.value)"
+          ' || terraform output
+
+      - name: Terraform Destroy
+        if: github.event.inputs.action == 'destroy'
+        run: |
+          cd "terraform/${{ needs.validate-inputs.outputs.environment }}"
+          echo "🗑️  Destroying Terraform infrastructure..."
+          echo "⚠️  This will permanently delete all resources!"
+          
+          terraform destroy -auto-approve
+          
+          echo "✅ Infrastructure destruction completed"
+
+      - name: Upload Terraform Plan
+        if: github.event.inputs.action == 'plan' && (steps.plan.outputs.plan_exitcode == '2' || steps.plan.outputs.plan_exitcode == '0')
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ needs.validate-inputs.outputs.environment }}
+          path: terraform/${{ needs.validate-inputs.outputs.environment }}/tfplan
+          retention-days: 5
+
+      - name: Upload Terraform State
+        if: github.event.inputs.action == 'apply' || github.event.inputs.action == 'destroy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-config-${{ needs.validate-inputs.outputs.environment }}
+          path: terraform/${{ needs.validate-inputs.outputs.environment }}/
+          retention-days: 30
+
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, terraform-plan-apply]
+    if: always()
+    
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "# 🚀 Environment Setup Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: \`${{ needs.validate-inputs.outputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **AWS Region**: \`${{ needs.validate-inputs.outputs.aws_region }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: \`${{ github.event.inputs.action }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECR Services**: \`${{ needs.validate-inputs.outputs.ecr_services }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 🏗️ Infrastructure Components" >> $GITHUB_STEP_SUMMARY
+          echo "### EKS Cluster" >> $GITHUB_STEP_SUMMARY
+          echo "- **Name**: \`nextops-${{ needs.validate-inputs.outputs.environment }}-eks\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`1.33\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Node Group**: Managed node group with auto-scaling" >> $GITHUB_STEP_SUMMARY
+          echo "- **Encryption**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
+          echo "- **Logging**: ✅ Comprehensive control plane logs" >> $GITHUB_STEP_SUMMARY
+          echo "- **Subnets**: ✅ Properly configured (us-east-1e excluded if needed)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### ECR Repositories" >> $GITHUB_STEP_SUMMARY
+          IFS=',' read -ra services <<< "${{ needs.validate-inputs.outputs.ecr_services }}"
+          for service in "${services[@]}"; do
+            service=$(echo "$service" | xargs)
+            echo "- **\`nextops-${{ needs.validate-inputs.outputs.environment }}-${service}\`**" >> $GITHUB_STEP_SUMMARY
+            echo "  - Image scanning: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
+            echo "  - KMS encryption: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
+            echo "  - Lifecycle policies: ✅ Configured" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 🗄️ Backend Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Bucket**: \`${{ needs.validate-inputs.outputs.state_bucket }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **DynamoDB Table**: \`${{ needs.validate-inputs.outputs.state_table }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **State Encryption**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
+          echo "- **State Locking**: ✅ Enabled" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 🔧 Bug Fixes Applied" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ **EKS Node Group Subnets**: Fixed missing \`node_group_subnet_ids\` parameter" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ **ECR Deprecation**: Using \`repository_info\` output instead of deprecated fields" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ **us-east-1e Exclusion**: Filtered out unsupported availability zone for EKS" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add status based on job results
+          if [[ "${{ needs.terraform-plan-apply.result }}" == "success" ]]; then
+            echo "## ✅ Status: Success" >> $GITHUB_STEP_SUMMARY
+            if [[ "${{ github.event.inputs.action }}" == "apply" ]]; then
+              echo "Infrastructure has been successfully deployed and is ready for use." >> $GITHUB_STEP_SUMMARY
+            elif [[ "${{ github.event.inputs.action }}" == "plan" ]]; then
+              echo "Terraform plan completed successfully. Review the plan and run with 'apply' action to deploy." >> $GITHUB_STEP_SUMMARY
+            elif [[ "${{ github.event.inputs.action }}" == "destroy" ]]; then
+              echo "Infrastructure has been successfully destroyed." >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "## ❌ Status: Failed" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the job logs for details and retry the deployment." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated by GitHub Actions workflow: \`environment-setup\`*" >> $GITHUB_STEP_SUMMARY
