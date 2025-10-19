@@ -1,247 +1,264 @@
 # Environment Setup Workflow
 
-This document describes how to use the Environment Setup GitHub Actions workflow to provision EKS clusters and ECR repositories.
+This document provides comprehensive guidance for using the Environment Setup GitHub Actions workflow to provision AWS infrastructure using Terraform.
 
-## 🎯 Overview
+## Overview
 
-The Environment Setup workflow provisions AWS infrastructure using Terraform modules from the [terraform-scripts](https://github.com/PrakashNexTurn/terraform-scripts) repository. It creates:
+The Environment Setup workflow automates the provisioning of environment-level shared infrastructure including:
 
-- **EKS Cluster**: Managed Kubernetes cluster with auto-scaling node groups
-- **ECR Repositories**: Container registries for each specified service
-- **Backend Infrastructure**: S3 bucket and DynamoDB table for Terraform state management
+- **Amazon EKS Cluster** with managed node groups
+- **ECR Repositories** for container image storage
+- **Terraform Backend** (S3 + DynamoDB) for state management
 
-## 🚀 Quick Start
+## Quick Start
 
-### Prerequisites
+### 1. Navigate to Actions Tab
+Go to the GitHub Actions tab in the [aws-infrastructure](https://github.com/PrakashNexTurn/aws-infrastructure) repository.
 
-1. **AWS Credentials**: Ensure the following secrets are configured in the repository:
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
+### 2. Select Environment Setup Workflow
+Find and click on "Environment Setup" workflow.
 
-2. **Permissions**: The AWS credentials must have permissions for:
-   - EKS (cluster creation and management)
-   - ECR (repository creation and management)
-   - S3 (bucket creation and management)
-   - DynamoDB (table creation and management)
-   - VPC and networking (default VPC access)
-   - IAM (roles and policies for EKS)
+### 3. Run Workflow
+Click "Run workflow" and configure the parameters:
 
-### Running the Workflow
+| Parameter | Description | Example | Required |
+|-----------|-------------|---------|----------|
+| **environment** | Target environment | `dev`, `staging`, `prod` | ✅ Yes |
+| **ecr_services** | Comma-separated service list | `frontend,backend,api` | ✅ Yes |
+| **action** | Terraform action | `plan`, `apply`, `destroy` | ✅ Yes |
+| **aws_region** | AWS deployment region | `us-west-2` | ❌ No (default: us-west-2) |
 
-1. Navigate to **Actions** → **Environment Setup** in the GitHub repository
-2. Click **Run workflow**
-3. Fill in the required parameters:
-   - **Environment**: Choose `dev`, `staging`, or `prod`
-   - **ECR Services**: Enter comma-separated service names (e.g., `frontend,backend,api`)
-   - **Action**: Select `plan`, `apply`, or `destroy`
-   - **AWS Region**: Choose target region (optional, defaults to `us-west-2`)
+### 4. Monitor Execution
+Watch the workflow progress through each stage and review the deployment summary.
 
-## 📋 Configuration Reference
+## Workflow Stages
 
-### Environment-Specific Settings
+### Stage 1: Input Validation
+- Validates environment name (dev/staging/prod)
+- Validates ECR service names (lowercase, alphanumeric, hyphens, underscores)
+- Handles AWS region constraints (e.g., EKS us-east-1e limitation)
+- Sets up pipeline variables
 
-| Setting | Dev | Staging | Prod |
-|---------|-----|---------|------|
-| **EKS Node Group** |
-| Desired Size | 2 | 2 | 3 |
-| Min Size | 1 | 1 | 2 |
-| Max Size | 3 | 3 | 5 |
-| Instance Type | t3.medium | t3.medium | t3.large |
-| **ECR Settings** |
-| Max Images | 10 | 10 | 20 |
-| Retention (days) | 7 | 7 | 14 |
-| Force Delete | true | true | false |
+### Stage 2: Backend Setup
+- **S3 Bucket Creation**: `nextops-terraform-state-<environment>`
+  - Enables versioning for state history
+  - Configures server-side encryption (AES256)
+  - Blocks all public access
+- **DynamoDB Table Creation**: `nextops-terraform-state-<environment>`
+  - Provides state locking mechanism
+  - Prevents concurrent modifications
 
-### Resource Naming Conventions
+### Stage 3: Infrastructure Provisioning
+- **EKS Cluster Deployment**:
+  - Kubernetes version 1.33
+  - Managed node groups with auto-scaling
+  - KMS encryption for secrets
+  - Comprehensive control plane logging
+  - Proper subnet configuration (filters out us-east-1e if needed)
+- **ECR Repository Creation**:
+  - Per-service container registries
+  - Vulnerability scanning enabled
+  - KMS encryption
+  - Lifecycle policies for image management
 
-- **EKS Cluster**: `nextops-<environment>-eks`
-- **ECR Repositories**: `nextops-<environment>-<service-name>`
-- **S3 Backend**: `nextops-terraform-state-<environment>`
-- **DynamoDB Lock**: `nextops-terraform-state-<environment>`
+### Stage 4: Summary Generation
+- Deployment status and configuration
+- Infrastructure component details
+- Output values for integration
 
-### Service Name Requirements
+## Infrastructure Components
 
-ECR service names must:
-- Start with alphanumeric character
-- Contain only lowercase letters, numbers, hyphens, underscores, and periods
-- Examples: `frontend`, `auth-service`, `api_gateway`, `web.app`
+### EKS Cluster Configuration
 
-## 🔧 Workflow Actions
+| Environment | Node Size | Min Nodes | Max Nodes | Desired Nodes | Instance Type |
+|-------------|-----------|-----------|-----------|---------------|---------------|
+| **dev** | Small | 1 | 3 | 2 | t3.medium |
+| **staging** | Small | 1 | 3 | 2 | t3.medium |
+| **prod** | Large | 2 | 5 | 3 | t3.large |
 
-### Plan (`plan`)
-- Validates Terraform configuration
-- Shows what changes will be made
-- Uploads plan artifact for review
-- **Use case**: Review changes before deployment
+**Features Enabled:**
+- ✅ KMS encryption for secrets
+- ✅ Control plane logging (API, audit, authenticator, controller manager, scheduler)
+- ✅ Managed node groups with auto-scaling
+- ✅ VPC integration with default VPC and subnets
+- ✅ Proper availability zone handling (excludes us-east-1e for EKS compatibility)
 
-### Apply (`apply`)
-- Executes the Terraform plan
-- Provisions actual AWS resources
-- Generates infrastructure summary
-- **Use case**: Deploy infrastructure
+### ECR Repository Configuration
 
-### Destroy (`destroy`)
-- Removes all provisioned resources
-- Cleans up infrastructure
-- **Use case**: Tear down environment
+Each service gets its own ECR repository with:
 
-## 🏗️ Infrastructure Components
+| Feature | dev/staging | prod |
+|---------|-------------|------|
+| **Image Scanning** | ✅ Enabled | ✅ Enabled |
+| **KMS Encryption** | ✅ Enabled | ✅ Enabled |
+| **Force Delete** | ✅ Yes | ❌ No |
+| **Max Images** | 10 | 20 |
+| **Retention (Untagged)** | 7 days | 14 days |
 
-### EKS Cluster Features
-- **Version**: Kubernetes 1.33
-- **Security**: KMS encryption, private/public API endpoints
-- **Logging**: Comprehensive control plane logs
-- **Networking**: Uses default VPC and subnets
-- **Auto-scaling**: Managed node groups with configurable sizing
-- **Add-ons**: CoreDNS, VPC CNI, Kube Proxy
+**Protected Tags:** `latest`, `main`, `master`, `<environment>`, `stable`
 
-### ECR Repository Features
-- **Security**: KMS encryption, vulnerability scanning
-- **Lifecycle**: Automatic cleanup of old images
-- **Access**: Private repositories with IAM-based access
-- **Tagging**: Consistent tagging strategy
-- **Protected Tags**: `latest`, `main`, `master`, `<environment>`, `stable`
+## AWS Regions Support
 
-### Backend Infrastructure
-- **State Storage**: Versioned S3 bucket with encryption
-- **State Locking**: DynamoDB table for concurrent access prevention
-- **Security**: Public access blocked, server-side encryption
-- **Backup**: Versioned state files for rollback capability
+| Region | Status | Notes |
+|--------|--------|-------|
+| **us-east-1** | ✅ Supported | us-east-1e AZ automatically excluded for EKS |
+| **us-west-1** | ✅ Supported | Full AZ support |
+| **us-west-2** | ✅ Supported | Default region |
+| **eu-west-1** | ✅ Supported | Full AZ support |
+| **ap-southeast-1** | ✅ Supported | Full AZ support |
 
-## 📊 Monitoring and Outputs
+## Required Secrets
 
-### Terraform Outputs
+Ensure these GitHub Action secrets are configured in your repository:
 
-The workflow provides the following outputs:
+| Secret Name | Description | Example |
+|-------------|-------------|---------|
+| `AWS_ACCESS_KEY_ID` | AWS Access Key ID | `AKIAIOSFODNN7EXAMPLE` |
+| `AWS_SECRET_ACCESS_KEY` | AWS Secret Access Key | `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` |
 
-**EKS Cluster**:
-- `eks_cluster_id`: Cluster identifier
-- `eks_cluster_arn`: Cluster ARN
-- `eks_cluster_endpoint`: Kubernetes API endpoint
-- `eks_cluster_version`: Kubernetes version
-- `eks_node_group_arn`: Node group ARN
-- `eks_node_group_status`: Node group status
+## Usage Examples
 
-**ECR Repositories** (per service):
-- `ecr_<service>_repository_url`: Repository URL
-- `ecr_<service>_repository_arn`: Repository ARN
-
-### Workflow Summary
-
-Each workflow run generates a comprehensive summary including:
-- Configuration details
-- Infrastructure components
-- Backend configuration
-- Deployment status
-- Resource URLs and ARNs
-
-## 🛡️ Security Considerations
-
-### Encryption
-- **EKS**: Cluster encryption enabled with KMS
-- **ECR**: Repository encryption with customer-managed KMS keys
-- **S3**: Server-side encryption for state files
-- **DynamoDB**: Encryption at rest for lock table
-
-### Access Control
-- **EKS**: RBAC with AWS IAM integration
-- **ECR**: IAM-based repository access
-- **Backend**: S3 bucket policy and public access blocking
-- **Network**: Security groups and VPC isolation
-
-### Compliance
-- **Scanning**: ECR vulnerability scanning enabled
-- **Logging**: CloudTrail integration for audit trails
-- **Tagging**: Consistent resource tagging for governance
-- **Backup**: State versioning for disaster recovery
-
-## 🚨 Important Constraints
-
-### AWS Region Limitations
-- **us-east-1e**: Not supported by EKS (workflow handles this automatically)
-- **Availability Zones**: Requires at least 2 AZs in the region
-
-### Resource Limits
-- **ECR**: Repository names must be unique within AWS account
-- **EKS**: One cluster per environment (managed by workflow)
-- **State**: One state file per environment
-
-### Cost Considerations
-- **EKS**: Cluster costs ~$0.10/hour + node costs
-- **ECR**: Storage costs for container images
-- **Data Transfer**: Cross-AZ and internet transfer costs
-
-## 🔄 Common Workflows
-
-### Initial Environment Setup
-1. Run with `action: plan` to review changes
-2. Review the generated plan artifact
-3. Run with `action: apply` to create infrastructure
-4. Verify outputs and test connectivity
-
-### Adding New Services
-1. Update `ecr_services` parameter with new service names
-2. Run with `action: plan` to see new ECR repositories
-3. Run with `action: apply` to create new repositories
-
-### Environment Updates
-1. Modify Terraform modules in terraform-scripts repository
-2. Run with `action: plan` to preview updates
-3. Run with `action: apply` to implement changes
-
-### Environment Cleanup
-1. Ensure no critical data in ECR repositories
-2. Run with `action: destroy` to remove all resources
-3. Verify cleanup in AWS console
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**Invalid Service Names**
+### Example 1: Deploy Development Environment
+```yaml
+environment: dev
+ecr_services: frontend,backend,api,worker
+action: plan
+aws_region: us-west-2
 ```
-❌ Invalid service name: MyService. Must be lowercase alphanumeric...
-```
-- Solution: Use lowercase with hyphens/underscores only
 
-**Backend Initialization Failures**
+### Example 2: Production Deployment
+```yaml
+environment: prod
+ecr_services: web-app,api-gateway,auth-service,notification-service
+action: apply
+aws_region: us-east-1
 ```
-❌ Failed to initialize Terraform backend
-```
-- Check AWS credentials and permissions
-- Verify S3 bucket and DynamoDB table access
 
-**EKS Cluster Creation Failures**
+### Example 3: Infrastructure Cleanup
+```yaml
+environment: staging
+ecr_services: frontend,backend
+action: destroy
+aws_region: eu-west-1
 ```
-❌ Cannot create cluster in us-east-1e
-```
-- Use different region or verify availability zones
-- Check VPC and subnet configuration
 
-**Terraform Plan Failures**
+## Output Values
+
+After successful deployment, the workflow provides these outputs:
+
+### EKS Cluster Outputs
+- `eks_cluster_id` - The ID of the EKS cluster
+- `eks_cluster_arn` - The ARN of the cluster
+- `eks_cluster_endpoint` - Kubernetes API server endpoint
+- `eks_cluster_version` - Kubernetes version
+- `eks_node_group_arn` - Node group ARN
+- `eks_node_group_status` - Node group status
+
+### ECR Repository Outputs (per service)
+- `ecr_<service>_repository_url` - Repository URL
+- `ecr_<service>_repository_arn` - Repository ARN
+- `ecr_<service>_repository_info` - Complete repository information
+
+### Infrastructure Details
+- `vpc_id` - VPC ID used
+- `subnet_ids` - List of subnet IDs used
+
+## Troubleshooting
+
+### Common Issues and Solutions
+
+#### Issue 1: EKS Node Group Subnet Configuration Error
+**Error**: `Attribute subnet_ids requires 1 item minimum, but config has only 0 declared`
+
+**Solution**: ✅ **FIXED** - The workflow now properly passes `node_group_subnet_ids` parameter to the EKS module.
+
+#### Issue 2: ECR Output Deprecation Warnings
+**Error**: `The attribute "name" is deprecated. Refer to the provider documentation`
+
+**Solution**: ✅ **FIXED** - Updated to use `repository_info` output which provides comprehensive repository details without deprecated attributes.
+
+#### Issue 3: us-east-1e Availability Zone Error
+**Error**: EKS does not support creating control plane instances in us-east-1e
+
+**Solution**: ✅ **FIXED** - Automatic filtering excludes us-east-1e when deploying in us-east-1 region.
+
+#### Issue 4: S3 Bucket Already Exists (Different Region)
+**Error**: `BucketAlreadyOwnedByYou` or cross-region bucket issues
+
+**Solution**: 
+1. Check if bucket exists in different region
+2. Delete existing bucket if safe to do so
+3. Or modify the bucket naming pattern in the workflow
+
+#### Issue 5: DynamoDB Table Already Exists
+**Error**: `ResourceInUseException` when creating DynamoDB table
+
+**Solution**: 
+1. Check existing table configuration
+2. Ensure table has correct schema (LockID as hash key)
+3. Delete table if migration is needed
+
+#### Issue 6: Insufficient AWS Permissions
+**Error**: Various `AccessDenied` errors
+
+**Required Permissions**:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "eks:*",
+        "ecr:*",
+        "s3:*",
+        "dynamodb:*",
+        "iam:*",
+        "kms:*",
+        "ec2:*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
 ```
-❌ Terraform plan failed with exit code: 1
-```
-- Review Terraform configuration syntax
-- Verify module source accessibility
-- Check variable values and constraints
+
+### Debugging Steps
+
+1. **Check Workflow Logs**: Review each job's detailed logs
+2. **Validate Inputs**: Ensure all parameters meet validation requirements
+3. **Terraform State**: Check S3 bucket for state file issues
+4. **AWS Console**: Verify resources in AWS console
+5. **Re-run with Plan**: Use `plan` action first to preview changes
 
 ### Getting Help
 
-1. **Workflow Logs**: Check GitHub Actions logs for detailed error messages
-2. **Terraform Output**: Review Terraform plan/apply output for specific errors
-3. **AWS Console**: Verify resource states and permissions in AWS
-4. **Module Documentation**: Check terraform-scripts repository for module updates
+1. **Check workflow summary** for deployment details
+2. **Review job logs** for specific error messages
+3. **Validate AWS permissions** for the service account
+4. **Check AWS quotas** for EKS and ECR in your region
+5. **Verify network configuration** (VPC, subnets, security groups)
 
-## 📚 Additional Resources
+## Best Practices
 
-- [Terraform AWS Provider Documentation](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)
-- [EKS Best Practices Guide](https://aws.github.io/aws-eks-best-practices/)
-- [ECR User Guide](https://docs.aws.amazon.com/AmazonECR/latest/userguide/)
-- [GitHub Actions Documentation](https://docs.github.com/en/actions)
+### Security
+- ✅ Use least-privilege IAM policies
+- ✅ Enable encryption for all resources
+- ✅ Regularly rotate AWS access keys
+- ✅ Monitor resource access and usage
+
+### Cost Optimization
+- 🔄 Use `destroy` action to clean up dev/staging environments when not needed
+- 📊 Monitor EKS node group scaling
+- 📈 Review ECR storage costs and lifecycle policies
+- 💰 Consider spot instances for non-production workloads
+
+### Operational Excellence
+- 📋 Always run `plan` before `apply` in production
+- 🔄 Maintain environment parity where possible
+- 📝 Document any manual changes outside Terraform
+- 🚀 Use proper tagging for resource management
 
 ---
 
-**Workflow File**: `.github/workflows/environment-setup.yml`  
-**Last Updated**: October 2024  
-**Maintained By**: Platform Engineering Team
+**Updated**: Latest version includes critical bug fixes for EKS node group configuration and ECR deprecation warnings.
