@@ -1,0 +1,395 @@
+name: Application Onboarding Automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Onboarding action to perform'
+        required: true
+        type: choice
+        options:
+          - onboard
+          - offboard
+        default: 'onboard'
+      application_name:
+        description: 'Application name (e.g., devops-demo)'
+        required: true
+        default: 'devops-demo'
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: 'dev'
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_VERSION: 1.12.1
+
+jobs:
+  onboard-application:
+    name: ${{ inputs.action == 'onboard' && 'Onboard' || 'Offboard' }} Application
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: Checkout Terraform Modules
+        uses: actions/checkout@v4
+        with:
+          repository: PrakashNexTurn/terraform-scripts
+          ref: develop
+          path: terraform-scripts
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create Terraform Configuration
+        run: |
+          mkdir -p infrastructure/applications/${{ inputs.application_name }}
+          cat > infrastructure/applications/${{ inputs.application_name }}/main.tf << 'EOF'
+          terraform {
+            required_version = ">= 1.0"
+            required_providers {
+              aws = {
+                source  = "hashicorp/aws"
+                version = "~> 5.0"
+              }
+            }
+            backend "s3" {
+              bucket         = "nextops-terraform-state-${{ inputs.environment }}"
+              key            = "applications/${{ inputs.application_name }}/terraform.tfstate"
+              region         = "${{ env.AWS_REGION }}"
+              dynamodb_table = "nextops-terraform-state-${{ inputs.environment }}"
+              encrypt        = true
+            }
+          }
+
+          provider "aws" {
+            region = "${{ env.AWS_REGION }}"
+          }
+
+          # Data sources for existing resources
+          data "aws_ecr_repository" "existing" {
+            name = "nextops-dev-backend"
+          }
+
+          data "aws_codestarconnections_connection" "github" {
+            name = "nextops-github"
+          }
+
+          # Generate unique pipeline name
+          locals {
+            pipeline_name = "${{ inputs.application_name }}-${{ inputs.environment }}-pipeline"
+            
+            common_tags = {
+              Environment   = "${{ inputs.environment }}"
+              Application   = "${{ inputs.application_name }}"
+              ManagedBy     = "terraform"
+              CreatedBy     = "github-actions"
+              JiraTicket    = "DEVOPS-7"
+            }
+          }
+
+          # CodePipeline Module
+          module "codepipeline" {
+            source = "git::https://github.com/PrakashNexTurn/terraform-scripts.git//modules/codepipeline?ref=develop"
+
+            pipeline_name     = local.pipeline_name
+            github_repository = "PrakashNexTurn/${{ inputs.application_name }}"
+            github_branch     = "main"
+            pipeline_type     = "V2"
+
+            # Use existing GitHub connection
+            create_github_connection      = false
+            existing_github_connection_arn = data.aws_codestarconnections_connection.github.arn
+
+            # Create dedicated artifacts bucket for this application
+            create_artifacts_bucket = true
+            artifacts_bucket_name   = "${local.pipeline_name}-artifacts"
+            
+            # Build stages configuration
+            build_stages = [
+              {
+                name = "Test"
+                actions = [
+                  {
+                    name             = "UnitTest"
+                    input_artifacts  = ["source_output"]
+                    output_artifacts = ["test_output"]
+                    project_name     = aws_codebuild_project.test.name
+                  }
+                ]
+              },
+              {
+                name = "Build"
+                actions = [
+                  {
+                    name             = "BuildApplication"
+                    input_artifacts  = ["source_output"]
+                    output_artifacts = ["build_output"]
+                    project_name     = aws_codebuild_project.build.name
+                  }
+                ]
+              }
+            ]
+
+            common_tags = local.common_tags
+          }
+
+          # CodeBuild Project for Testing
+          resource "aws_codebuild_project" "test" {
+            name          = "${local.pipeline_name}-test"
+            description   = "Test project for ${{ inputs.application_name }}"
+            service_role  = aws_iam_role.codebuild.arn
+
+            artifacts {
+              type = "CODEPIPELINE"
+            }
+
+            environment {
+              compute_type                = "BUILD_GENERAL1_SMALL"
+              image                      = "aws/codebuild/amazonlinux2-x86_64-standard:5.0"
+              type                       = "LINUX_CONTAINER"
+              image_pull_credentials_type = "CODEBUILD"
+            }
+
+            source {
+              type = "CODEPIPELINE"
+              buildspec = "buildspec-test.yml"
+            }
+
+            tags = local.common_tags
+          }
+
+          # CodeBuild Project for Building and Pushing to ECR
+          resource "aws_codebuild_project" "build" {
+            name          = "${local.pipeline_name}-build"
+            description   = "Build and push project for ${{ inputs.application_name }}"
+            service_role  = aws_iam_role.codebuild.arn
+
+            artifacts {
+              type = "CODEPIPELINE"
+            }
+
+            environment {
+              compute_type                = "BUILD_GENERAL1_SMALL"
+              image                      = "aws/codebuild/amazonlinux2-x86_64-standard:5.0"
+              type                       = "LINUX_CONTAINER"
+              image_pull_credentials_type = "CODEBUILD"
+              privileged_mode            = true
+
+              environment_variable {
+                name  = "ECR_REPOSITORY_URI"
+                value = data.aws_ecr_repository.existing.repository_url
+              }
+
+              environment_variable {
+                name  = "AWS_DEFAULT_REGION"
+                value = "${{ env.AWS_REGION }}"
+              }
+
+              environment_variable {
+                name  = "AWS_ACCOUNT_ID"
+                value = data.aws_caller_identity.current.account_id
+              }
+            }
+
+            source {
+              type = "CODEPIPELINE"
+              buildspec = "buildspec.yml"
+            }
+
+            tags = local.common_tags
+          }
+
+          # Data source for current AWS account ID
+          data "aws_caller_identity" "current" {}
+
+          # IAM Role for CodeBuild
+          resource "aws_iam_role" "codebuild" {
+            name = "${local.pipeline_name}-codebuild-role"
+
+            assume_role_policy = jsonencode({
+              Version = "2012-10-17"
+              Statement = [
+                {
+                  Action = "sts:AssumeRole"
+                  Effect = "Allow"
+                  Principal = {
+                    Service = "codebuild.amazonaws.com"
+                  }
+                }
+              ]
+            })
+
+            tags = local.common_tags
+          }
+
+          # IAM Policy for CodeBuild
+          resource "aws_iam_role_policy" "codebuild" {
+            role = aws_iam_role.codebuild.name
+
+            policy = jsonencode({
+              Version = "2012-10-17"
+              Statement = [
+                {
+                  Effect = "Allow"
+                  Action = [
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ]
+                  Resource = "arn:aws:logs:${{ env.AWS_REGION }}:${data.aws_caller_identity.current.account_id}:log-group:/aws/codebuild/*"
+                },
+                {
+                  Effect = "Allow"
+                  Action = [
+                    "s3:GetObject",
+                    "s3:GetObjectVersion",
+                    "s3:PutObject"
+                  ]
+                  Resource = "arn:aws:s3:::${local.pipeline_name}-artifacts/*"
+                },
+                {
+                  Effect = "Allow"
+                  Action = [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage",
+                    "ecr:GetAuthorizationToken",
+                    "ecr:PutImage",
+                    "ecr:InitiateLayerUpload",
+                    "ecr:UploadLayerPart",
+                    "ecr:CompleteLayerUpload"
+                  ]
+                  Resource = ["*"]
+                }
+              ]
+            })
+          }
+          EOF
+
+      - name: Create Outputs Configuration
+        run: |
+          cat > infrastructure/applications/${{ inputs.application_name }}/outputs.tf << 'EOF'
+          output "pipeline_name" {
+            description = "Name of the created CodePipeline"
+            value       = module.codepipeline.pipeline_name
+          }
+
+          output "pipeline_arn" {
+            description = "ARN of the created CodePipeline"
+            value       = module.codepipeline.pipeline_arn
+          }
+
+          output "pipeline_id" {
+            description = "ID of the created CodePipeline"
+            value       = module.codepipeline.pipeline_id
+          }
+
+          output "artifacts_bucket_name" {
+            description = "Name of the artifacts S3 bucket"
+            value       = module.codepipeline.artifacts_bucket_name
+          }
+
+          output "github_connection_arn" {
+            description = "ARN of the GitHub connection used"
+            value       = data.aws_codestarconnections_connection.github.arn
+          }
+
+          output "ecr_repository_url" {
+            description = "URL of the ECR repository used"
+            value       = data.aws_ecr_repository.existing.repository_url
+          }
+
+          output "start_execution_command" {
+            description = "AWS CLI command to start pipeline execution"
+            value       = module.codepipeline.start_execution_command
+          }
+          EOF
+
+      - name: Initialize Terraform
+        run: |
+          cd infrastructure/applications/${{ inputs.application_name }}
+          terraform init
+
+      - name: Validate Terraform Configuration
+        run: |
+          cd infrastructure/applications/${{ inputs.application_name }}
+          terraform validate
+
+      - name: Plan Terraform Changes
+        id: plan
+        run: |
+          cd infrastructure/applications/${{ inputs.application_name }}
+          if [ "${{ inputs.action }}" == "onboard" ]; then
+            terraform plan -out=tfplan
+            echo "plan_exit_code=$?" >> $GITHUB_OUTPUT
+          else
+            terraform plan -destroy -out=tfplan
+            echo "plan_exit_code=$?" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Apply Terraform Changes
+        if: steps.plan.outputs.plan_exit_code == '0' || steps.plan.outputs.plan_exit_code == '2'
+        run: |
+          cd infrastructure/applications/${{ inputs.application_name }}
+          terraform apply -auto-approve tfplan
+
+      - name: Display Terraform Outputs
+        if: inputs.action == 'onboard' && (steps.plan.outputs.plan_exit_code == '0' || steps.plan.outputs.plan_exit_code == '2')
+        run: |
+          cd infrastructure/applications/${{ inputs.application_name }}
+          echo "## 🚀 Application Onboarding Completed Successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pipeline Information:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pipeline Name**: $(terraform output -raw pipeline_name)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Pipeline ARN**: $(terraform output -raw pipeline_arn)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifacts Bucket**: $(terraform output -raw artifacts_bucket_name)" >> $GITHUB_STEP_SUMMARY
+          echo "- **ECR Repository**: $(terraform output -raw ecr_repository_url)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Push code to the **${{ inputs.application_name }}** repository" >> $GITHUB_STEP_SUMMARY
+          echo "2. The CodePipeline will automatically trigger and build your application" >> $GITHUB_STEP_SUMMARY
+          echo "3. Docker image will be pushed to the ECR repository" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Manual Pipeline Execution:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "$(terraform output -raw start_execution_command)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup on Offboard
+        if: inputs.action == 'offboard'
+        run: |
+          echo "## 🗑️ Application Offboarding Completed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All AWS resources for **${{ inputs.application_name }}** have been destroyed." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Cleaned Up Resources:" >> $GITHUB_STEP_SUMMARY
+          echo "- CodePipeline and associated stages" >> $GITHUB_STEP_SUMMARY
+          echo "- CodeBuild projects" >> $GITHUB_STEP_SUMMARY
+          echo "- IAM roles and policies" >> $GITHUB_STEP_SUMMARY
+          echo "- S3 artifacts bucket" >> $GITHUB_STEP_SUMMARY
+
+      - name: Archive Terraform Files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-config-${{ inputs.application_name }}-${{ inputs.action }}
+          path: infrastructure/applications/${{ inputs.application_name }}/
+          retention-days: 30
